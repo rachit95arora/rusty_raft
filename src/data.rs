@@ -1,6 +1,7 @@
-use serde::{Deserialize, Serialize};
-// use std::io::{Cursor, Read};
-// use tokio::io::AsyncReadExt;
+use std::mem::size_of;
+
+use bytes::{Buf, BufMut, BytesMut};
+use tokio_util::codec::{Decoder, Encoder};
 
 pub unsafe fn as_u8_slice<T: Sized>(p: &T) -> &[u8] {
     ::std::slice::from_raw_parts((p as *const T) as *const u8, ::std::mem::size_of::<T>())
@@ -9,20 +10,74 @@ pub unsafe fn as_u8_slice<T: Sized>(p: &T) -> &[u8] {
 pub const CONNECTION_BUF_SIZE: usize = 4 * 1024;
 type Error = Box<dyn std::error::Error>;
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub trait Bytable {
+    fn to_bytes(&self, bytes: &mut BytesMut);
+    fn from_bytes(bytes: &mut BytesMut) -> Option<Self>
+    where
+        Self: Sized;
+}
+
+#[derive(Debug, PartialEq)]
 pub struct KeyValCommand {
     pub key: u32,
     pub value: u64,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub struct Entry<CommandType> {
+impl Bytable for KeyValCommand {
+    fn to_bytes(&self, bytes: &mut BytesMut) {
+        bytes.put_u32(self.key);
+        bytes.put_u64(self.value);
+    }
+
+    fn from_bytes(bytes: &mut BytesMut) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        if bytes.len() >= size_of::<u32>() + size_of::<u64>() {
+            let key = bytes.get_u32();
+            let value = bytes.get_u64();
+            return Some(KeyValCommand { key, value });
+        }
+        None
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Entry<CommandType>
+where
+    CommandType: Bytable,
+{
     pub term: u64,
     pub index: u64,
     pub command: CommandType,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+impl<CommandType: Bytable> Bytable for Entry<CommandType> {
+    fn to_bytes(&self, bytes: &mut BytesMut) {
+        bytes.put_u64(self.term);
+        bytes.put_u64(self.index);
+        self.command.to_bytes(bytes);
+    }
+
+    fn from_bytes(bytes: &mut BytesMut) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        let term = bytes.get_u64();
+        let index = bytes.get_u64();
+        if let Some(command) = CommandType::from_bytes(bytes) {
+            Some(Self {
+                term,
+                index,
+                command,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub struct RequestVoteDesc {
     pub term: u64,
     pub candidate_id: u64,
@@ -30,13 +85,13 @@ pub struct RequestVoteDesc {
     pub last_log_term: u64,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq)]
 pub struct RequestVoteResponseDesc {
     pub current_term: u64,
     pub vote_granted: bool,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq)]
 pub struct AppendEntryDescHeader {
     pub term: u64,
     pub leader_id: u64,
@@ -45,13 +100,13 @@ pub struct AppendEntryDescHeader {
     pub commit_index: u64,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq)]
 pub struct AppendEntryDesc<EntryType> {
     pub header: AppendEntryDescHeader,
     pub entries: Vec<EntryType>,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq)]
 pub struct AppendEntryResponseDesc {
     pub current_term: u64,
     pub accepted: bool,
@@ -59,7 +114,7 @@ pub struct AppendEntryResponseDesc {
     pub last_term_first_index: u64,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq)]
 pub enum Message<EntryType> {
     RequestVote(RequestVoteDesc),
     AppendEntry(AppendEntryDesc<EntryType>),

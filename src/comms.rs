@@ -89,7 +89,7 @@ impl<EntryType> TcpCommunicatorBackend<EntryType> {
                 send_data = self.from_frontend.recv() => {
                      match send_data.unwrap() {
                          Payload::Halt => {
-                             halt_sender.send(true).await.unwrap();
+                             halt_sender.send(true).unwrap();
                              break;
                          },
                          Payload::ToId(id, bytes) => {

@@ -1,31 +1,38 @@
-use crate::data::as_u8_slice;
 use std::marker::PhantomData;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 
+use crate::data::Bytable;
+
 type Error = Box<dyn std::error::Error>;
-struct TypedLog<Entry> {
+struct DurableLog<Entry>
+where
+    Entry: Bytable,
+{
+    filename: String,
     filestream: BufWriter<tokio::fs::File>,
+    index: Vec<u64>,
     total_entries: usize,
     dummy: PhantomData<Entry>,
 }
 
-impl<Entry> TypedLog<Entry> {
-    const ENTRY_SIZE: usize = std::mem::size_of::<Entry>();
-    async fn new(filename: &str) -> Result<TypedLog<Entry>, Error> {
+impl<Entry: Bytable> DurableLog<Entry> {
+    async fn new(filename: &str) -> Result<DurableLog<Entry>, Error> {
         let file = tokio::fs::OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
             .open(filename)
             .await?;
-        let metadata = file.metadata().await?;
 
-        Ok(TypedLog {
+        Ok(DurableLog {
+            filename: String::from(filename),
             filestream: BufWriter::new(file),
             total_entries: (metadata.len() / Self::ENTRY_SIZE as u64) as usize,
             dummy: PhantomData,
         })
     }
+
+    async fn index_all_log(&mut self) {}
 
     fn total_entries(&self) -> usize {
         self.total_entries
@@ -102,7 +109,7 @@ mod persistance_tests {
     async fn append_and_read() {
         let mut rng = thread_rng();
         let filename = get_random_shm_name(&mut rng);
-        let mut logger = super::TypedLog::new(&filename).await.unwrap();
+        let mut logger = super::DurableLog::new(&filename).await.unwrap();
         let write_value = get_random_entries(&mut rng, 1, 3);
 
         logger.append_entries(&write_value).await.unwrap();
@@ -120,7 +127,7 @@ mod persistance_tests {
     async fn simple_rewrites() {
         let mut rng = thread_rng();
         let filename = get_random_shm_name(&mut rng);
-        let mut logger = super::TypedLog::new(&filename).await.unwrap();
+        let mut logger = super::DurableLog::new(&filename).await.unwrap();
         let write_value = get_random_entries(&mut rng, 1, 3);
 
         logger.append_entries(&write_value).await.unwrap();
@@ -142,7 +149,7 @@ mod persistance_tests {
     async fn write_and_remove_entries() {
         let mut rng = thread_rng();
         let filename = get_random_shm_name(&mut rng);
-        let mut logger = super::TypedLog::new(&filename).await.unwrap();
+        let mut logger = super::DurableLog::new(&filename).await.unwrap();
         let write_value = get_random_entries(&mut rng, 1, 3);
 
         logger.append_entries(&write_value).await.unwrap();

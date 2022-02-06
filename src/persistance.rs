@@ -1,11 +1,48 @@
 use bytes::BytesMut;
-use std::{marker::PhantomData, mem::size_of};
+use std::{fmt::Display, io::SeekFrom, marker::PhantomData, mem::size_of};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 
 use crate::data::{Bytable, NUM_BUFFERED_LOG_ENTRIES};
 
-type Error = Box<dyn std::error::Error>;
-struct DurableLog<Entry>
+#[derive(Debug)]
+pub enum LogError {
+    FileOpenFailed(String),
+    SeekError(SeekFrom),
+    UnexpectedEof,
+    WriteFailure,
+    ReadFailure,
+    TruncateFailure(u64),
+    SyncFailure,
+}
+
+impl Display for LogError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FileOpenFailed(file) => {
+                write!(f, "Failed to open file: {} for durable logger", file)
+            }
+            Self::SeekError(seek_from) => {
+                write!(f, "Failed to seek file to index: {:?}", seek_from)
+            }
+            Self::UnexpectedEof => {
+                write!(f, "Encountered unexpected EOF in logger file")
+            }
+            Self::WriteFailure => {
+                write!(f, "Failed to write to log file")
+            }
+            Self::ReadFailure => {
+                write!(f, "Failed to read from log file")
+            }
+            Self::TruncateFailure(len) => {
+                write!(f, "Failed to truncate log file to len: {}", len)
+            }
+            Self::SyncFailure => {
+                write!(f, "Failed to sync changes to log file")
+            }
+        }
+    }
+}
+pub struct DurableLog<Entry>
 where
     Entry: Bytable,
 {
@@ -18,13 +55,19 @@ where
 
 impl<Entry: Bytable> DurableLog<Entry> {
     const ENTRY_SIZE: usize = size_of::<Entry>();
-    async fn new(filename: &str) -> Result<DurableLog<Entry>, Error> {
-        let file = tokio::fs::OpenOptions::new()
+    pub async fn new(filename: &str) -> Result<DurableLog<Entry>, LogError> {
+        let file = match tokio::fs::OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
             .open(filename)
-            .await?;
+            .await
+        {
+            Ok(f) => f,
+            _ => {
+                return Err(LogError::FileOpenFailed(String::from(filename)));
+            }
+        };
 
         let buffer = BytesMut::with_capacity(Self::ENTRY_SIZE * 2);
 
@@ -41,87 +84,118 @@ impl<Entry: Bytable> DurableLog<Entry> {
         Ok(log)
     }
 
-    async fn index_all_log(&mut self) -> Result<(), Error> {
+    async fn index_all_log(&mut self) -> Result<(), LogError> {
         let mut running_index = 0u64;
-        self.filestream.seek(std::io::SeekFrom::Start(0)).await?;
+        match self.filestream.seek(SeekFrom::Start(0)).await {
+            Ok(_) => (),
+            Err(_) => return Err(LogError::SeekError(SeekFrom::Start(0))),
+        }
         loop {
             match self.filestream.read_u32().await {
                 Ok(frame_len) => {
                     running_index += size_of::<u32>() as u64 + frame_len as u64;
-                    self.filestream
+                    match self
+                        .filestream
                         .seek(std::io::SeekFrom::Start(running_index))
-                        .await?;
+                        .await
+                    {
+                        Ok(_) => (),
+                        Err(_) => return Err(LogError::SeekError(SeekFrom::Start(running_index))),
+                    }
                     self.index.push(running_index);
                 }
                 Err(err) => {
                     if err.kind() == tokio::io::ErrorKind::UnexpectedEof {
-                        eprintln!("Indexed Index: {:?}", self.index);
                         return Ok(());
                     }
-                    return Err(err.into());
+                    return Err(LogError::UnexpectedEof);
                 }
             }
         }
     }
 
-    fn total_entries(&self) -> usize {
+    pub fn total_entries(&self) -> usize {
         self.index.len() - 1
     }
 
-    async fn append_entries(&mut self, entries: &Vec<Entry>) -> Result<usize, Error> {
-        self.filestream.seek(std::io::SeekFrom::End(0)).await?;
+    pub async fn append_entries(&mut self, entries: &Vec<Entry>) -> Result<usize, LogError> {
+        match self.filestream.seek(std::io::SeekFrom::End(0)).await {
+            Ok(_) => (),
+            Err(err) => return Err(LogError::SeekError(SeekFrom::End(0))),
+        }
         for entry in entries.iter() {
             self.buffer.clear();
             self.buffer.reserve(2 * Self::ENTRY_SIZE);
             entry.to_bytes(&mut self.buffer);
 
-            self.filestream.write_u32(self.buffer.len() as u32).await?;
-            self.filestream.write_all(self.buffer.as_ref()).await?;
+            match self.filestream.write_u32(self.buffer.len() as u32).await {
+                Ok(_) => (),
+                Err(_) => return Err(LogError::WriteFailure),
+            }
+            match self.filestream.write_all(self.buffer.as_ref()).await {
+                Ok(_) => (),
+                Err(_) => return Err(LogError::WriteFailure),
+            }
 
             self.index.push(
                 size_of::<u32>() as u64 + self.buffer.len() as u64 + *self.index.last().unwrap(),
             )
         }
-        self.filestream.flush().await?;
-        self.filestream.get_ref().sync_all().await?;
-        eprintln!("Post append index: {:?}", self.index);
+        match self.filestream.flush().await {
+            Ok(_) => (),
+            Err(_) => return Err(LogError::WriteFailure),
+        }
+        match self.filestream.get_ref().sync_all().await {
+            Ok(_) => (),
+            Err(_) => return Err(LogError::WriteFailure),
+        }
         Ok(self.total_entries())
     }
 
-    async fn read_entries(&mut self, index: usize, count: usize) -> Result<Vec<Entry>, Error> {
+    pub async fn read_entries(
+        &mut self,
+        index: usize,
+        count: usize,
+    ) -> Result<Vec<Entry>, LogError> {
         let seek_index = std::cmp::min(self.total_entries(), index);
         let seek_offset = *self.index.get(seek_index).unwrap();
-        eprintln!("index: {}, offset: {}", seek_index, seek_offset);
-        self.filestream
-            .seek(std::io::SeekFrom::Start(seek_offset))
-            .await?;
+        match self.filestream.seek(SeekFrom::Start(seek_offset)).await {
+            Ok(_) => (),
+            Err(_) => return Err(LogError::SeekError(SeekFrom::Start(seek_offset))),
+        }
         let mut read_count = std::cmp::min(count, self.total_entries() - seek_index);
         let mut entries = Vec::with_capacity(read_count);
         while read_count > 0 {
-            let frame_len = self.filestream.read_u32().await?;
+            let frame_len = match self.filestream.read_u32().await {
+                Ok(len) => len,
+                Err(_) => return Err(LogError::ReadFailure),
+            };
             self.buffer.clear();
             self.buffer.reserve(frame_len as usize);
-            eprintln!(
-                "frame len: {}, capacity: {}",
-                frame_len,
-                self.buffer.capacity()
-            );
             unsafe {
                 self.buffer.set_len(frame_len as usize);
             }
-            self.filestream.read_exact(self.buffer.as_mut()).await?;
+            match self.filestream.read_exact(self.buffer.as_mut()).await {
+                Ok(_) => (),
+                Err(_) => return Err(LogError::ReadFailure),
+            }
             entries.push(Entry::from_bytes(&mut self.buffer).unwrap());
             read_count -= 1;
         }
-        eprintln!("Post read index: {:?}", self.index);
         Ok(entries)
     }
 
-    async fn remove_entries_from(&mut self, index: usize) -> Result<(), Error> {
+    pub async fn remove_entries_from(&mut self, index: usize) -> Result<(), LogError> {
         let num_entries = std::cmp::min(self.total_entries(), index);
         let remove_from = *self.index.get(num_entries).unwrap();
-        self.filestream.get_ref().set_len(remove_from).await?;
-        self.filestream.get_ref().sync_all().await?;
+        match self.filestream.get_ref().set_len(remove_from).await {
+            Ok(_) => (),
+            Err(_) => return Err(LogError::TruncateFailure(remove_from)),
+        }
+        match self.filestream.get_ref().sync_all().await {
+            Ok(_) => (),
+            Err(_) => return Err(LogError::SyncFailure),
+        }
         self.index.truncate(num_entries + 1);
         Ok(())
     }

@@ -9,7 +9,6 @@ use bytes::{Buf, BufMut, BytesMut};
 
 pub const CONNECTION_BUF_SIZE: usize = 4 * 1024;
 pub const NUM_BUFFERED_LOG_ENTRIES: usize = 10;
-pub type Error = Box<dyn std::error::Error>;
 
 pub trait Bytable {
     fn to_bytes(&self, bytes: &mut BytesMut);
@@ -19,7 +18,15 @@ pub trait Bytable {
     fn length_if_can_parse(bytes: &[u8]) -> Option<usize>;
 }
 
-#[derive(Debug, PartialEq)]
+pub trait Defaultable {
+    fn default() -> Self;
+}
+
+pub trait EntryT {
+    fn term(&self) -> u64;
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub struct KeyValCommand {
     pub key: u32,
     pub value: u64,
@@ -36,7 +43,7 @@ impl Bytable for KeyValCommand {
     where
         Self: Sized,
     {
-        if let Some(len) = Self::length_if_can_parse(&bytes[..]) {
+        if let Some(_len) = Self::length_if_can_parse(&bytes[..]) {
             let key = bytes.get_u32();
             let value = bytes.get_u64();
             return Some(KeyValCommand { key, value });
@@ -55,16 +62,31 @@ impl Bytable for KeyValCommand {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct Entry<CommandType>
+pub struct Request<CommandType>
 where
     CommandType: Bytable,
+{
+    pub seqnum: u64,
+    pub command: CommandType,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub struct Entry<CommandType>
+where
+    CommandType: Bytable + Copy + Clone,
 {
     pub term: u64,
     pub index: u64,
     pub command: CommandType,
 }
 
-impl<CommandType: Bytable> Bytable for Entry<CommandType> {
+impl<CommandType: Bytable + Copy + Clone> EntryT for Entry<CommandType> {
+    fn term(&self) -> u64 {
+        self.term
+    }
+}
+
+impl<CommandType: Bytable + Copy + Clone> Bytable for Entry<CommandType> {
     fn to_bytes(&self, bytes: &mut BytesMut) {
         bytes.put_u64(self.term);
         bytes.put_u64(self.index);

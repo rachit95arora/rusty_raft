@@ -1,9 +1,33 @@
-use std::{marker::PhantomData, mem::size_of};
+use std::{
+    fmt::{Debug, Display},
+    mem::size_of,
+};
 
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::data::{Bytable, Error};
+use crate::data::Bytable;
+
+#[derive(Debug)]
+pub enum ProtocolError {
+    UnknownMessageTag,
+}
+
+impl From<std::io::Error> for ProtocolError {
+    fn from(_: std::io::Error) -> Self {
+        ProtocolError::UnknownMessageTag
+    }
+}
+
+impl Display for ProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownMessageTag => {
+                write!(f, "Message with unknown tag encountered while parsing!")
+            }
+        }
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub struct RequestVoteDesc {
@@ -146,7 +170,7 @@ impl Bytable for AppendEntryDescHeader {
 #[derive(Debug, PartialEq)]
 pub struct AppendEntryDesc<EntryType>
 where
-    EntryType: Bytable,
+    EntryType: Bytable + Debug,
 {
     pub header: AppendEntryDescHeader,
     pub entries: Vec<EntryType>,
@@ -207,7 +231,7 @@ impl Bytable for AppendEntryResponseDesc {
 #[derive(Debug, PartialEq)]
 pub enum Message<EntryType>
 where
-    EntryType: Bytable,
+    EntryType: Bytable + Debug,
 {
     RequestVote(RequestVoteDesc),
     AppendEntry(AppendEntryDesc<EntryType>),
@@ -237,12 +261,13 @@ impl From<u8> for MessageTag {
     }
 }
 
-struct MessageCodec<EntryType: Bytable> {
-    _dummy: PhantomData<EntryType>,
+pub struct MessageCodec<EntryType: Bytable + Debug> {
+    partial_append_entry: Option<AppendEntryDesc<EntryType>>,
+    num_entries_left: Option<u64>,
 }
 
-impl<EntryType: Bytable> Encoder<Message<EntryType>> for MessageCodec<EntryType> {
-    type Error = Error;
+impl<EntryType: Bytable + Debug> Encoder<Message<EntryType>> for MessageCodec<EntryType> {
+    type Error = ProtocolError;
     fn encode(
         &mut self,
         item: Message<EntryType>,
@@ -274,62 +299,115 @@ impl<EntryType: Bytable> Encoder<Message<EntryType>> for MessageCodec<EntryType>
     }
 }
 
-impl<EntryType: Bytable> Decoder for MessageCodec<EntryType> {
+impl<EntryType: Bytable + Debug> MessageCodec<EntryType> {
+    pub fn new() -> Self {
+        MessageCodec {
+            partial_append_entry: None,
+            num_entries_left: None,
+        }
+    }
+    fn parse_remaining_entries(
+        &mut self,
+        src: &mut BytesMut,
+    ) -> Result<Option<Message<EntryType>>, ProtocolError> {
+        if let None = self.num_entries_left {
+            if src.len() < size_of::<u64>() {
+                return Ok(None);
+            }
+            self.num_entries_left = Some(src.get_u64());
+        }
+        let mut num_entries = self.num_entries_left.unwrap();
+        while num_entries > 0 {
+            if let Some(_len) = EntryType::length_if_can_parse(&src[..]) {
+                let append_entry_opt = std::mem::take(&mut self.partial_append_entry);
+                let mut append_entry = append_entry_opt.unwrap();
+                append_entry
+                    .entries
+                    .push(EntryType::from_bytes(src).unwrap());
+                num_entries -= 1;
+
+                // Update decoder state
+                self.num_entries_left = Some(num_entries);
+                self.partial_append_entry = Some(append_entry);
+            } else {
+                return Ok(None);
+            }
+        }
+        assert_eq!(
+            num_entries, 0,
+            "Only reach here if parsing all entries is complete! Failed!"
+        );
+        let append_entry_opt = std::mem::take(&mut self.partial_append_entry);
+        self.num_entries_left = None;
+        Ok(Some(Message::AppendEntry(append_entry_opt.unwrap())))
+    }
+}
+
+impl<EntryType: Bytable + Debug> Decoder for MessageCodec<EntryType> {
     type Item = Message<EntryType>;
-    type Error = Error;
+    type Error = ProtocolError;
 
     fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if src.len() < 1 {
             return Ok(None);
         }
-        let message_tag: MessageTag = src.get_u8().into();
-        match message_tag {
-            MessageTag::AppendEntryTag => {
-                if let Some(len) = AppendEntryDescHeader::length_if_can_parse(&src[..]) {
-                    if src.len() < size_of::<u64>() + len {
-                        return Ok(None);
+        if let None = self.partial_append_entry {
+            let message_tag: MessageTag = src.get_u8().into();
+            match message_tag {
+                MessageTag::AppendEntryTag => {
+                    if let Some(_len) = AppendEntryDescHeader::length_if_can_parse(&src[..]) {
+                        let header = AppendEntryDescHeader::from_bytes(src).unwrap();
+                        self.partial_append_entry = Some(AppendEntryDesc {
+                            header,
+                            entries: Vec::new(),
+                        });
+                        self.num_entries_left = None;
+                        return self.parse_remaining_entries(src);
                     }
                 }
-            }
-            MessageTag::RequestVoteTag => {
-                if let Some(_len) = RequestVoteDesc::length_if_can_parse(&src[..]) {
-                    match RequestVoteDesc::from_bytes(src) {
-                        Some(desc) => {
-                            return Ok(Some(Message::RequestVote(desc)));
-                        }
-                        None => {
-                            panic!("Parsing implementation bug! RequestVote parsing failed despite checking");
-                        }
-                    }
-                }
-            }
-            MessageTag::AppendEntryResponseTag => {
-                if let Some(_len) = AppendEntryResponseDesc::length_if_can_parse(&src[..]) {
-                    match AppendEntryResponseDesc::from_bytes(src) {
-                        Some(desc) => {
-                            return Ok(Some(Message::AppendEntryResponse(desc)));
-                        }
-                        None => {
-                            panic!("Parsing implementation bug! RequestVote parsing failed despite checking");
+                MessageTag::RequestVoteTag => {
+                    if let Some(_len) = RequestVoteDesc::length_if_can_parse(&src[..]) {
+                        match RequestVoteDesc::from_bytes(src) {
+                            Some(desc) => {
+                                return Ok(Some(Message::RequestVote(desc)));
+                            }
+                            None => {
+                                panic!("Parsing implementation bug! RequestVote parsing failed despite checking");
+                            }
                         }
                     }
                 }
-            }
-            MessageTag::RequestVoteResponseTag => {
-                if let Some(_len) = RequestVoteResponseDesc::length_if_can_parse(&src[..]) {
-                    match RequestVoteResponseDesc::from_bytes(src) {
-                        Some(desc) => {
-                            return Ok(Some(Message::RequestVoteResponse(desc)));
-                        }
-                        None => {
-                            panic!("Parsing implementation bug! RequestVote parsing failed despite checking");
+                MessageTag::AppendEntryResponseTag => {
+                    if let Some(_len) = AppendEntryResponseDesc::length_if_can_parse(&src[..]) {
+                        match AppendEntryResponseDesc::from_bytes(src) {
+                            Some(desc) => {
+                                return Ok(Some(Message::AppendEntryResponse(desc)));
+                            }
+                            None => {
+                                panic!("Parsing implementation bug! RequestVote parsing failed despite checking");
+                            }
                         }
                     }
                 }
+                MessageTag::RequestVoteResponseTag => {
+                    if let Some(_len) = RequestVoteResponseDesc::length_if_can_parse(&src[..]) {
+                        match RequestVoteResponseDesc::from_bytes(src) {
+                            Some(desc) => {
+                                return Ok(Some(Message::RequestVoteResponse(desc)));
+                            }
+                            None => {
+                                panic!("Parsing implementation bug! RequestVote parsing failed despite checking");
+                            }
+                        }
+                    }
+                }
+                MessageTag::UnknownTag => {
+                    return Err(ProtocolError::UnknownMessageTag);
+                }
             }
-            MessageTag::UnknownTag => {
-                return Err("Illegible message type encountered while decoding!".into());
-            }
+        } else {
+            // Parse the remaining entries for the partial append entry
+            return self.parse_remaining_entries(src);
         }
         Ok(None)
     }

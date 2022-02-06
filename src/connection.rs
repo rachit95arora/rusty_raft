@@ -1,87 +1,98 @@
-use crate::data::as_u8_slice;
-use crate::data::Message;
-use crate::data::MessageAction;
+use crate::data::Bytable;
 use crate::data::CONNECTION_BUF_SIZE;
-use bytes::{Buf, BytesMut};
-use std::io::{self, Cursor};
-use std::marker::PhantomData;
-use tokio::io::AsyncReadExt;
+use crate::protocol::Message;
+use crate::protocol::MessageCodec;
+use crate::protocol::ProtocolError;
+use bytes::Bytes;
+use futures::StreamExt;
+use std::fmt::Debug;
+use std::fmt::Display;
+use std::sync::Arc;
+use tokio::io::split;
+use tokio::io::AsyncWriteExt;
 use tokio::io::BufWriter;
+use tokio::io::ReadHalf;
+use tokio::io::WriteHalf;
 use tokio::net::TcpStream;
-type Error = Box<dyn std::error::Error>;
+use tokio_util::codec::FramedRead;
 
-pub struct Connection<StreamType, EntryType> {
-    stream: BufWriter<StreamType>,
-    buffer: BytesMut,
-    _dummy: PhantomData<EntryType>,
+#[derive(Debug)]
+pub enum CommError {
+    MissingFrameOnStream,
+    StreamWriteFailure,
+    BackendSendFailure,
+    DataEncodingFailure,
+    AddressConnectFailure(String),
+    FailedFrameParse(ProtocolError),
+    StreamSendFailure,
 }
 
-impl<StreamType, EntryType> Connection<StreamType, EntryType> {
-    pub fn new(socket: StreamType) -> Connection<StreamType, EntryType> {
+impl Display for CommError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommError::MissingFrameOnStream => {
+                write!(f, "Found no frame on Tcp stream")
+            }
+            CommError::StreamWriteFailure => {
+                write!(f, "Failed to write message to stream")
+            }
+            CommError::BackendSendFailure => {
+                write!(f, "Failed to send payload to comms backend!")
+            }
+            CommError::FailedFrameParse(err) => {
+                write!(f, "Failed to parse next frame with error: {}", err)
+            }
+            CommError::DataEncodingFailure => {
+                write!(f, "Failed to encode user data to bytes!")
+            }
+            CommError::AddressConnectFailure(addr) => {
+                write!(f, "Failed to connect to ip address: {}", addr)
+            }
+            CommError::StreamSendFailure => {
+                write!(f, "Failed to send encoded bytes over TcpStream!")
+            }
+        }
+    }
+}
+pub struct Connection<EntryType>
+where
+    EntryType: Bytable + Debug,
+{
+    read_stream: FramedRead<ReadHalf<TcpStream>, MessageCodec<EntryType>>,
+    write_stream: BufWriter<WriteHalf<TcpStream>>,
+}
+
+impl<EntryType: Bytable + Debug> Connection<EntryType> {
+    pub fn new(socket: TcpStream) -> Self {
+        let (read_end, write_end) = split(socket);
         Connection {
-            stream: BufWriter::new(socket),
-            buffer: BytesMut::with_capacity(CONNECTION_BUF_SIZE),
-            _dummy: PhantomData,
+            read_stream: FramedRead::with_capacity(
+                read_end,
+                MessageCodec::new(),
+                CONNECTION_BUF_SIZE,
+            ),
+            write_stream: BufWriter::with_capacity(CONNECTION_BUF_SIZE, write_end),
         }
     }
 
-    pub async fn read_message(&mut self) -> Result<Option<Message<EntryType>>, Error> {
-        loop {
-            if let Some(msg) = self.parse_message()? {
-                return Ok(Some(msg));
-            }
-
-            if 0 == self.stream.read_buf(&mut self.buffer).await? {
-                if self.buffer.is_empty() {
-                    return Ok(None);
-                } else {
-                    return Err("Connection reset by peer".into());
-                }
-            }
+    pub async fn read_message(&mut self) -> Result<Message<EntryType>, CommError> {
+        let result = self.read_stream.next().await;
+        match result {
+            Some(Ok(message)) => Ok(message),
+            Some(Err(error)) => Err(CommError::FailedFrameParse(error)),
+            None => Err(CommError::MissingFrameOnStream),
         }
     }
 
-    fn parse_message(&mut self) -> Result<Option<Message<EntryType>>, Error> {
-        let mut buf = Cursor::new(&self.buffer[..]);
-        match crate::data::bytes_to_message(&buf) {
-            Ok(Some((msg, sz))) => {
-                self.buffer.advance(sz);
-                Ok(Some(msg))
-            }
-            Ok(None) => Ok(None),
-            Err(a) => Err(a),
+    pub async fn write_message(&mut self, message: Arc<Bytes>) -> Result<(), CommError> {
+        match self.write_stream.write_all(&message[..]).await {
+            Ok(_) => (),
+            Err(_) => return Err(CommError::StreamWriteFailure),
         }
-    }
-
-    pub async fn write_messages(&mut self, messages: &[Message<EntryType>]) -> Result<(), Error> {
-        for msg in messages {
-            match msg {
-                Message::RequestVote(desc) => {
-                    self.stream.write_u8(MessageAction::ReqVote).await?;
-                    self.stream.write_all(unsafe { as_u8_slice(desc) }).await?;
-                }
-                Message::AppendEntry(desc) => {
-                    self.stream.write_u8(MessageAction::AppEnt).await?;
-                    self.stream
-                        .write_all(unsafe { as_u8_slice(desc.header) })
-                        .await?;
-                    self.stream.write_u64(desc.entries.len() as u64).await?;
-                    for entry in desc.entries() {
-                        self.stream.write_all(unsafe { as_u8_slice(entry) }).await?;
-                    }
-                }
-                Message::RequestVoteResponse(desc) => {
-                    self.stream.write_u8(MessageAction::ReqVoteRes).await?;
-                    self.stream.write_all(unsafe { as_u8_slice(desc) }).await?;
-                }
-                Message::AppendEntryResponse(desc) => {
-                    self.stream.write_u8(MessageAction::AppEntResp).await?;
-                    self.stream.write_all(unsafe { as_u8_slice(desc) }).await?;
-                }
-            }
+        match self.write_stream.flush().await {
+            Ok(_) => (),
+            Err(_) => return Err(CommError::StreamWriteFailure),
         }
-        self.stream.flush().await;
-        self.stream.get_ref().flush().await?;
         Ok(())
     }
 }
